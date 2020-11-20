@@ -26,6 +26,7 @@ module Data.Array.Accelerate.LLVM.PTX.Execute (
 
 ) where
 
+import Data.Array.Accelerate.Representation.Array ()
 import Data.Array.Accelerate.Analysis.Match
 import Data.Array.Accelerate.Error
 import Data.Array.Accelerate.Lifetime
@@ -431,32 +432,34 @@ scanAllOp
 scanAllOp tp exe gamma aenv m input@(delayedShape -> ((), n)) =
   withExecutable exe $ \ptxExecutable -> do
     let
+        reprFlag = ArrayR dim1 $ TupRsingle $ scalarTypeInt32
         k1  = ptxExecutable !# "scanP1"
-        k2  = ptxExecutable !# "scanP2"
-        k3  = ptxExecutable !# "scanP3"
-        --
         c   = kernelThreadBlockSize k1
         s   = n `multipleOf` c
         --
         repr = ArrayR dim1 tp
         paramR = TupRsingle $ ParamRarray repr
-        paramsR1 = paramR `TupRpair` paramR `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr)
-        paramsR3 = paramR `TupRpair` paramR `TupRpair` TupRsingle ParamRint
-    --
+        paramsR1 = paramR `TupRpair` TupRsingle (ParamRfuture $ ParamRarray reprFlag) `TupRpair` paramR `TupRpair` paramR `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr)
+        
     future  <- new
     result  <- allocateRemote repr ((), m)
 
     -- Step 1: Independent thread-block-wide scans of the input. Small arrays
     -- which can be computed by a single thread block will require no
     -- additional work.
-    tmp     <- allocateRemote repr ((), s)
-    executeOp k1 gamma aenv dim1 ((), s) paramsR1 ((tmp, result), manifest input)
+    sum     <- allocateRemote repr ((), s)
+    dum     <- allocateRemote repr ((), s)
+    foo@(Array _ tmpflag)  <- allocateRemote reprFlag ((), s)
+    flag     <- new :: Par PTX (Future (Vector Int32))
+    fork $ do arrFlag <- memsetArrayAsync (NumSingleType $ IntegralNumType TypeInt32) s 0 tmpflag
+              put flag . Array ((), s) =<< get arrFlag
+    executeOp k1 gamma aenv dim1 ((), s) paramsR1 ((((result, flag), dum), sum), manifest input)
+    
+
+    --
 
     -- Step 2: Multi-block reductions need to compute the per-block prefix,
     -- then apply those values to the partial results.
-    when (s > 1) $ do
-      executeOp k2 gamma aenv dim1 ((), s)   paramR tmp
-      executeOp k3 gamma aenv dim1 ((), s-1) paramsR3 ((tmp, result), c)
 
     put future result
     return future
@@ -844,12 +847,14 @@ executeOp kernel gamma aenv shr sh paramsR params =
 launch :: HasCallStack => Kernel -> Stream -> Int -> [CUDA.FunParam] -> IO ()
 launch Kernel{..} stream n args =
   withLifetime stream $ \st ->
-    Debug.monitorProcTime query msg (Just st) $
-      CUDA.launchKernel kernelFun grid cta smem (Just st) args
+    do
+      Debug.monitorProcTime query msg (Just st) $
+        CUDA.launchKernel kernelFun grid cta smem (Just st) args
   where
     cta   = (kernelThreadBlockSize, 1, 1)
     grid  = (kernelThreadBlocks n, 1, 1)
     smem  = kernelSharedMemBytes
+    
 
     -- Debugging/monitoring support
     query = if Debug.monitoringIsEnabled
@@ -862,4 +867,6 @@ launch Kernel{..} stream n args =
       Debug.traceIO Debug.dump_exec $
         printf "exec: %s <<< %d, %d, %d >>> %s"
                (unpack kernelName) (fst3 grid) (fst3 cta) smem (Debug.elapsed wall cpu gpu)
+      
+      
 
