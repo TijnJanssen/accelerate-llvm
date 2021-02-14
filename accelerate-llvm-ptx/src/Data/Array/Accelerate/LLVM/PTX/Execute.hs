@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE CPP                 #-}
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE GADTs               #-}
@@ -26,6 +27,7 @@ module Data.Array.Accelerate.LLVM.PTX.Execute (
 
 ) where
 
+import Data.Array.Accelerate.Representation.Array ()
 import Data.Array.Accelerate.Analysis.Match
 import Data.Array.Accelerate.Error
 import Data.Array.Accelerate.Lifetime
@@ -59,6 +61,7 @@ import Data.List                                                ( find )
 import Data.Maybe                                               ( fromMaybe )
 import Text.Printf                                              ( printf )
 import Prelude                                                  hiding ( exp, map, sum, scanl, scanr )
+import Data.Primitive.Vec (Vec)
 
 
 {-# SPECIALISE INLINE executeAcc     :: ExecAcc     PTX      a ->             Par PTX (FutureArraysR PTX a) #-}
@@ -412,11 +415,49 @@ scanCore
     -> Delayed (Array (sh, Int) e)
     -> Par PTX (Future (Array (sh, Int) e))
 scanCore repr exe gamma aenv m input
-  | ArrayR (ShapeRsnoc ShapeRz) tp <- repr
-  = scanAllOp tp exe gamma aenv m input
-  --
-  | otherwise
-  = scanDimOp repr exe gamma aenv m input
+  =codeScan
+
+  where 
+    codeScan = case repr of
+      ArrayR (ShapeRsnoc ShapeRz) tp -> case tp of
+        (TupRsingle (SingleScalarType (NumSingleType(IntegralNumType TypeInt32)))) -> scanStruct exe gamma aenv m input
+        _ -> scanAllOp tp exe gamma aenv m input
+      _ -> scanDimOp repr exe gamma aenv m input
+
+{-# INLINE scanStruct #-}
+scanStruct ::
+  HasCallStack =>
+  ExecutableR PTX ->
+  Gamma aenv ->
+  Val aenv ->
+  Int -> -- output size
+  Delayed (Vector Int32) ->
+  Par PTX (Future (Vector Int32))
+scanStruct exe gamma aenv m input@(delayedShape -> ((), n)) =
+  withExecutable exe $ \ptxExecutable -> do
+    let reprStruct = ArrayR dim1 $ TupRsingle$ VectorScalarType (VectorType 2 (singleType @Int32):: VectorType (Vec 2 Int32))
+        k1 = ptxExecutable !# "scanStruct"
+        c = kernelThreadBlockSize k1
+        s = n `multipleOf` c
+
+        --
+        repr = ArrayR dim1 (TupRsingle scalarTypeInt32 )
+        paramR = TupRsingle $ ParamRarray repr
+        paramsR1 = paramR `TupRpair` TupRsingle (ParamRarray reprStruct)  `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr)
+
+    future <- new
+    result <- allocateRemote repr ((), m)
+    foo@(Array _ tmpStruct)  <- allocateRemote reprStruct ((), s)
+    fstruct    <- new :: Par PTX (Future (Vector (Vec 2 Int32)))
+    fork $ do arrStruct <- memsetArrayAsync (NumSingleType $ IntegralNumType TypeInt32) s 0 tmpStruct
+              put fstruct . Array ((), s) =<< get arrStruct--}
+    -- Step 1: Independent thread-block-wide scans of the input. Small arrays
+    -- which can be computed by a single thread block will require no
+    -- additional work.
+    struct <- allocateRemote reprStruct ((), s)
+    executeOp k1 gamma aenv dim1 ((), s) paramsR1 ((result, struct), manifest input)
+    put future result
+    return future
 
 {-# INLINE scanAllOp #-}
 scanAllOp
@@ -431,32 +472,34 @@ scanAllOp
 scanAllOp tp exe gamma aenv m input@(delayedShape -> ((), n)) =
   withExecutable exe $ \ptxExecutable -> do
     let
+        reprFlag = ArrayR dim1 $ TupRsingle $ scalarTypeInt32
         k1  = ptxExecutable !# "scanP1"
-        k2  = ptxExecutable !# "scanP2"
-        k3  = ptxExecutable !# "scanP3"
-        --
         c   = kernelThreadBlockSize k1
         s   = n `multipleOf` c
         --
         repr = ArrayR dim1 tp
         paramR = TupRsingle $ ParamRarray repr
-        paramsR1 = paramR `TupRpair` paramR `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr)
-        paramsR3 = paramR `TupRpair` paramR `TupRpair` TupRsingle ParamRint
-    --
+        paramsR1 = paramR `TupRpair` TupRsingle (ParamRfuture $ ParamRarray reprFlag) `TupRpair` paramR `TupRpair` paramR `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr)
+        
     future  <- new
     result  <- allocateRemote repr ((), m)
 
     -- Step 1: Independent thread-block-wide scans of the input. Small arrays
     -- which can be computed by a single thread block will require no
     -- additional work.
-    tmp     <- allocateRemote repr ((), s)
-    executeOp k1 gamma aenv dim1 ((), s) paramsR1 ((tmp, result), manifest input)
+    sum     <- allocateRemote repr ((), s)
+    dum     <- allocateRemote repr ((), s)
+    foo@(Array _ tmpflag)  <- allocateRemote reprFlag ((), s)
+    flag     <- new :: Par PTX (Future (Vector Int32))
+    fork $ do arrFlag <- memsetArrayAsync (NumSingleType $ IntegralNumType TypeInt32) s 0 tmpflag
+              put flag . Array ((), s) =<< get arrFlag
+    executeOp k1 gamma aenv dim1 ((), s) paramsR1 ((((result, flag), dum), sum), manifest input)
+    
+
+    --
 
     -- Step 2: Multi-block reductions need to compute the per-block prefix,
     -- then apply those values to the partial results.
-    when (s > 1) $ do
-      executeOp k2 gamma aenv dim1 ((), s)   paramR tmp
-      executeOp k3 gamma aenv dim1 ((), s-1) paramsR3 ((tmp, result), c)
 
     put future result
     return future
@@ -844,12 +887,14 @@ executeOp kernel gamma aenv shr sh paramsR params =
 launch :: HasCallStack => Kernel -> Stream -> Int -> [CUDA.FunParam] -> IO ()
 launch Kernel{..} stream n args =
   withLifetime stream $ \st ->
-    Debug.monitorProcTime query msg (Just st) $
-      CUDA.launchKernel kernelFun grid cta smem (Just st) args
+    do
+      Debug.monitorProcTime query msg (Just st) $
+        CUDA.launchKernel kernelFun grid cta smem (Just st) args
   where
     cta   = (kernelThreadBlockSize, 1, 1)
     grid  = (kernelThreadBlocks n, 1, 1)
     smem  = kernelSharedMemBytes
+    
 
     -- Debugging/monitoring support
     query = if Debug.monitoringIsEnabled
@@ -862,4 +907,6 @@ launch Kernel{..} stream n args =
       Debug.traceIO Debug.dump_exec $
         printf "exec: %s <<< %d, %d, %d >>> %s"
                (unpack kernelName) (fst3 grid) (fst3 cta) smem (Debug.elapsed wall cpu gpu)
+      
+      
 
