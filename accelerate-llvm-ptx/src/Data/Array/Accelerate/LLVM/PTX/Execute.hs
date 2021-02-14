@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE CPP                 #-}
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE GADTs               #-}
@@ -60,6 +61,7 @@ import Data.List                                                ( find )
 import Data.Maybe                                               ( fromMaybe )
 import Text.Printf                                              ( printf )
 import Prelude                                                  hiding ( exp, map, sum, scanl, scanr )
+import Data.Primitive.Vec (Vec)
 
 
 {-# SPECIALISE INLINE executeAcc     :: ExecAcc     PTX      a ->             Par PTX (FutureArraysR PTX a) #-}
@@ -413,11 +415,49 @@ scanCore
     -> Delayed (Array (sh, Int) e)
     -> Par PTX (Future (Array (sh, Int) e))
 scanCore repr exe gamma aenv m input
-  | ArrayR (ShapeRsnoc ShapeRz) tp <- repr
-  = scanAllOp tp exe gamma aenv m input
-  --
-  | otherwise
-  = scanDimOp repr exe gamma aenv m input
+  =codeScan
+
+  where 
+    codeScan = case repr of
+      ArrayR (ShapeRsnoc ShapeRz) tp -> case tp of
+        (TupRsingle (SingleScalarType (NumSingleType(IntegralNumType TypeInt32)))) -> scanStruct exe gamma aenv m input
+        _ -> scanAllOp tp exe gamma aenv m input
+      _ -> scanDimOp repr exe gamma aenv m input
+
+{-# INLINE scanStruct #-}
+scanStruct ::
+  HasCallStack =>
+  ExecutableR PTX ->
+  Gamma aenv ->
+  Val aenv ->
+  Int -> -- output size
+  Delayed (Vector Int32) ->
+  Par PTX (Future (Vector Int32))
+scanStruct exe gamma aenv m input@(delayedShape -> ((), n)) =
+  withExecutable exe $ \ptxExecutable -> do
+    let reprStruct = ArrayR dim1 $ TupRsingle$ VectorScalarType (VectorType 2 (singleType @Int32):: VectorType (Vec 2 Int32))
+        k1 = ptxExecutable !# "scanStruct"
+        c = kernelThreadBlockSize k1
+        s = n `multipleOf` c
+
+        --
+        repr = ArrayR dim1 (TupRsingle scalarTypeInt32 )
+        paramR = TupRsingle $ ParamRarray repr
+        paramsR1 = paramR `TupRpair` TupRsingle (ParamRarray reprStruct)  `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr)
+
+    future <- new
+    result <- allocateRemote repr ((), m)
+    foo@(Array _ tmpStruct)  <- allocateRemote reprStruct ((), s)
+    fstruct    <- new :: Par PTX (Future (Vector (Vec 2 Int32)))
+    fork $ do arrStruct <- memsetArrayAsync (NumSingleType $ IntegralNumType TypeInt32) s 0 tmpStruct
+              put fstruct . Array ((), s) =<< get arrStruct--}
+    -- Step 1: Independent thread-block-wide scans of the input. Small arrays
+    -- which can be computed by a single thread block will require no
+    -- additional work.
+    struct <- allocateRemote reprStruct ((), s)
+    executeOp k1 gamma aenv dim1 ((), s) paramsR1 ((result, struct), manifest input)
+    put future result
+    return future
 
 {-# INLINE scanAllOp #-}
 scanAllOp
